@@ -17,6 +17,7 @@
 #include <string.h>
 #include <math.h>
 #include <pthread.h>
+#include <Python.h>
 
 #define MAX_STRING 100
 #define EXP_TABLE_SIZE 1000
@@ -30,7 +31,7 @@ typedef float real;                    // Precision of float numbers
 
 struct vocab_word {
   long long cn;
-  int *point;
+  int *point, *hash;
   char *word, *code, codelen;
 };
 
@@ -39,6 +40,7 @@ char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
 struct vocab_word *vocab;
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
 int *vocab_hash;
+int bf_k = 7, bf_size = 1024*1024;
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
@@ -122,6 +124,7 @@ int AddWordToVocab(char *word) {
   unsigned int hash, length = strlen(word) + 1;
   if (length > MAX_STRING) length = MAX_STRING;
   vocab[vocab_size].word = (char *)calloc(length, sizeof(char));
+  vocab[vocab_size].hash = (int *)calloc(bf_k, sizeof(int));
   strcpy(vocab[vocab_size].word, word);
   vocab[vocab_size].cn = 0;
   vocab_size++;
@@ -179,7 +182,10 @@ void ReduceVocab() {
     vocab[b].cn = vocab[a].cn;
     vocab[b].word = vocab[a].word;
     b++;
-  } else free(vocab[a].word);
+  } else {
+    free(vocab[a].word);
+    free(vocab[a].hash);
+  }
   vocab_size = b;
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   for (a = 0; a < vocab_size; a++) {
@@ -338,21 +344,21 @@ void ReadVocab() {
 void InitNet() {
   long long a, b;
   unsigned long long next_random = 1;
-  a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
+  a = posix_memalign((void **)&syn0, 128, (long long)bf_size * layer1_size * sizeof(real));
   if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
   if (hs) {
-    a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
+    a = posix_memalign((void **)&syn1, 128, (long long)bf_size * layer1_size * sizeof(real));
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
-    for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+    for (a = 0; a < bf_size; a++) for (b = 0; b < layer1_size; b++)
      syn1[a * layer1_size + b] = 0;
   }
   if (negative>0) {
-    a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));
+    a = posix_memalign((void **)&syn1neg, 128, (long long)bf_size * layer1_size * sizeof(real));
     if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
-    for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+    for (a = 0; a < bf_size; a++) for (b = 0; b < layer1_size; b++)
      syn1neg[a * layer1_size + b] = 0;
   }
-  for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++) {
+  for (a = 0; a < bf_size; a++) for (b = 0; b < layer1_size; b++) {
     next_random = next_random * (unsigned long long)25214903917 + 11;
     syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
   }
@@ -360,7 +366,7 @@ void InitNet() {
 }
 
 void *TrainModelThread(void *id) {
-  long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0;
+  long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0, i;
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
   long long l1, l2, c, target, label, local_iter = iter;
   unsigned long long next_random = (long long)id;
@@ -368,6 +374,7 @@ void *TrainModelThread(void *id) {
   clock_t now;
   real *neu1 = (real *)calloc(layer1_size, sizeof(real));
   real *neu1e = (real *)calloc(layer1_size, sizeof(real));
+  real *sum = (real *)calloc(layer1_size, sizeof(real));
   FILE *fi = fopen(train_file, "rb");
   fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
   while (1) {
@@ -417,6 +424,7 @@ void *TrainModelThread(void *id) {
     if (word == -1) continue;
     for (c = 0; c < layer1_size; c++) neu1[c] = 0;
     for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
+    for (c = 0; c < layer1_size; c++) sum[c] = 0;
     next_random = next_random * (unsigned long long)25214903917 + 11;
     b = next_random % window;
     if (cbow) {  //train the cbow architecture
@@ -486,7 +494,11 @@ void *TrainModelThread(void *id) {
         if (c >= sentence_length) continue;
         last_word = sen[c];
         if (last_word == -1) continue;
-        l1 = last_word * layer1_size;
+        for (i = 0; i < bf_k; i++) {
+          l1 = vocab[last_word].hash[i] * layer1_size;
+          for (c = 0; c < layer1_size; c++)
+            sum[c] += syn0[c + l1];
+        }
         for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
         // HIERARCHICAL SOFTMAX
         if (hs) for (d = 0; d < vocab[word].codelen; d++) {
@@ -516,17 +528,23 @@ void *TrainModelThread(void *id) {
             if (target == word) continue;
             label = 0;
           }
-          l2 = target * layer1_size;
-          f = 0;
-          for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
-          if (f > MAX_EXP) g = (label - 1) * alpha;
-          else if (f < -MAX_EXP) g = (label - 0) * alpha;
-          else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
-          for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
-          for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * syn0[c + l1];
+          for (i = 0; i < bf_k; i++) {
+            l2 = vocab[target].hash[i] * layer1_size;
+            f = 0;
+            for (c = 0; c < layer1_size; c++) f += sum[c] * syn1neg[c + l2];
+            if (f > MAX_EXP) g = (label - 1) * alpha;
+            else if (f < -MAX_EXP) g = (label - 0) * alpha;
+            else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+            for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
+            for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * sum[c];
+          }
         }
         // Learn weights input -> hidden
-        for (c = 0; c < layer1_size; c++) syn0[c + l1] += neu1e[c];
+        for (i = 0; i < bf_k; i++) {
+          l1 = vocab[last_word].hash[i] * layer1_size;
+          for (c = 0; c < layer1_size; c++)
+            syn0[c + l1] += neu1e[c];
+        }
       }
     }
     sentence_position++;
@@ -536,15 +554,120 @@ void *TrainModelThread(void *id) {
     }
   }
   fclose(fi);
+  free(sum);
   free(neu1);
   free(neu1e);
   pthread_exit(NULL);
 }
 
+int bf() {
+  PyObject *pName, *pModule, *pFunc;
+  PyObject *pArgs, *pValue, *pValue2, *pValue3, *pList;
+  int i, j;
+
+  Py_Initialize();
+  PyRun_SimpleString("import sys");
+  PyRun_SimpleString("sys.path.append('/home/sclan/tmp')");
+  pName = PyUnicode_DecodeFSDefault("bf");
+
+  pModule = PyImport_Import(pName);
+  Py_DECREF(pName);
+
+  if (pModule != NULL) {
+    pFunc = PyObject_GetAttrString(pModule, "c_bf");
+    /* pFunc is a new reference */
+
+    if (pFunc && PyCallable_Check(pFunc)) {
+      pList = PyList_New(vocab_size);
+      for (i = 0; i < vocab_size; ++i) {
+        pValue = PyUnicode_FromString(vocab[i].word);
+        if (!pValue) {
+          Py_DECREF(pList);
+          Py_DECREF(pModule);
+          fprintf(stderr, "Cannot convert argument\n");
+          return 1;
+        }
+        /* pValue reference stolen here: */
+        PyList_SetItem(pList, i, pValue);
+      }
+
+      pArgs = PyTuple_New(3);
+      PyTuple_SetItem(pArgs, 0, pList);
+      pValue = PyLong_FromLong((long) bf_k);
+      if (!pValue) {
+        Py_DECREF(pArgs);
+        Py_DECREF(pList);
+        Py_DECREF(pModule);
+        fprintf(stderr, "Cannot convert argument\n");
+        return 1;
+      }
+      /* pValue reference stolen here: */
+      PyTuple_SetItem(pArgs, 1, pValue);
+      pValue = PyLong_FromLong((long) bf_size);
+      if (!pValue) {
+        Py_DECREF(pArgs);
+        Py_DECREF(pList);
+        Py_DECREF(pModule);
+        fprintf(stderr, "Cannot convert argument\n");
+        return 1;
+      }
+      /* pValue reference stolen here: */
+      PyTuple_SetItem(pArgs, 2, pValue);
+
+      pValue = PyObject_CallObject(pFunc, pArgs);
+      Py_DECREF(pArgs);
+      if (pValue != NULL) {
+        for (i = 0; i < vocab_size; ++i) {
+          pValue2 = PyList_GetItem(pValue, i);
+          if (!pValue2 || !PyList_Check(pValue2)) {
+            Py_DECREF(pList);
+            Py_DECREF(pModule);
+            fprintf(stderr, "Cannot convert result\n");
+            return 1;
+          }
+          for (j = 0; j < bf_k; ++j) {
+            pValue3 = PyList_GetItem(pValue2, j);
+            if (!pValue3 || !PyLong_Check(pValue3)) {
+              Py_DECREF(pList);
+              Py_DECREF(pModule);
+              fprintf(stderr, "Cannot convert result\n");
+              return 1;
+            }
+            vocab[i].hash[j] = (int) PyLong_AsLong(pValue3);
+          }
+        }
+        Py_DECREF(pValue);
+      }
+      else {
+        Py_DECREF(pFunc);
+        Py_DECREF(pModule);
+        PyErr_Print();
+        fprintf(stderr,"Call failed\n");
+        return 1;
+      }
+    }
+    else {
+      if (PyErr_Occurred())
+        PyErr_Print();
+      fprintf(stderr, "Cannot find function \"%s\"\n", "c_bf");
+    }
+    Py_XDECREF(pFunc);
+    Py_DECREF(pModule);
+  }
+  else {
+    PyErr_Print();
+    fprintf(stderr, "Failed to load \"%s\"\n", "bf");
+    return 1;
+  }
+  Py_Finalize();
+  return 0;
+}
+
 void TrainModel() {
-  long a, b, c, d;
+  long a, b, c, d, i, l1;
   FILE *fo;
   pthread_t *pt = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
+  real *sum = (real *)calloc(layer1_size, sizeof(real));
   printf("Starting training using file %s\n", train_file);
   starting_alpha = alpha;
   if (read_vocab_file[0] != 0) ReadVocab(); else LearnVocabFromTrainFile();
@@ -552,6 +675,7 @@ void TrainModel() {
   if (output_file[0] == 0) return;
   InitNet();
   if (negative > 0) InitUnigramTable();
+  bf();
   start = clock();
   for (a = 0; a < num_threads; a++) pthread_create(&pt[a], NULL, TrainModelThread, (void *)a);
   for (a = 0; a < num_threads; a++) pthread_join(pt[a], NULL);
@@ -560,9 +684,15 @@ void TrainModel() {
     // Save the word vectors
     fprintf(fo, "%lld %lld\n", vocab_size, layer1_size);
     for (a = 0; a < vocab_size; a++) {
+      for (c = 0; c < layer1_size; c++) sum[c] = 0;
+      for (i = 0; i < bf_k; i++) {
+        l1 = vocab[a].hash[i] * layer1_size;
+        for (c = 0; c < layer1_size; c++)
+          sum[c] += syn0[c + l1];
+      }
       fprintf(fo, "%s ", vocab[a].word);
-      if (binary) for (b = 0; b < layer1_size; b++) fwrite(&syn0[a * layer1_size + b], sizeof(real), 1, fo);
-      else for (b = 0; b < layer1_size; b++) fprintf(fo, "%lf ", syn0[a * layer1_size + b]);
+      if (binary) for (b = 0; b < layer1_size; b++) fwrite(&sum[b], sizeof(real), 1, fo);
+      else for (b = 0; b < layer1_size; b++) fprintf(fo, "%lf ", sum[b]);
       fprintf(fo, "\n");
     }
   } else {
@@ -609,6 +739,7 @@ void TrainModel() {
     free(cent);
     free(cl);
   }
+  free(sum);
   fclose(fo);
 }
 
@@ -690,6 +821,8 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-bf-k", argc, argv)) > 0) bf_k = atoi(argv[i + 1]);
+  if ((i = ArgPos((char *)"-bf-size", argc, argv)) > 0) bf_size = atoi(argv[i + 1]);
   vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
   vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
   expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
@@ -700,3 +833,4 @@ int main(int argc, char **argv) {
   TrainModel();
   return 0;
 }
+
