@@ -368,9 +368,9 @@ void InitNet() {
 void *TrainModelThread(void *id) {
   long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0, i;
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
-  long long l1, l2, c, target, label, local_iter = iter;
+  long long l1, l2, c, target, local_iter = iter;
   unsigned long long next_random = (long long)id;
-  real f, g;
+  real f, g, label;
   clock_t now;
   real *neu1 = (real *)calloc(layer1_size, sizeof(real));
   real *neu1e = (real *)calloc(layer1_size, sizeof(real));
@@ -520,7 +520,7 @@ void *TrainModelThread(void *id) {
         if (negative > 0) for (d = 0; d < negative + 1; d++) {
           if (d == 0) {
             target = word;
-            label = 1;
+            label = 1.0 / bf_k;
           } else {
             next_random = next_random * (unsigned long long)25214903917 + 11;
             target = table[(next_random >> 16) % table_size];
@@ -564,6 +564,8 @@ int bf() {
   PyObject *pName, *pModule, *pFunc;
   PyObject *pArgs, *pValue, *pValue2, *pValue3, *pList;
   int i, j;
+
+  printf("Computing BF hashes...\n");
 
   Py_Initialize();
   PyRun_SimpleString("import sys");
@@ -660,6 +662,7 @@ int bf() {
     return 1;
   }
   Py_Finalize();
+  printf("BF hashes done\n");
   return 0;
 }
 
